@@ -21,11 +21,46 @@ function getCurrentTime(): string {
   return new Date().toISOString();
 }
 
+// Manual tool tracking function to log tool usage to Helicone
+async function logToolUse(
+  groq: Groq, 
+  toolName: string, 
+  input: any, 
+  output: any,
+  sessionId: string,
+  sessionName: string,
+  sessionPath: string
+): Promise<void> {
+  // Log the tool usage by making a small API call to Groq via Helicone
+  await groq.chat.completions.create(
+    {
+      messages: [
+        {
+          role: "user",
+          content: `Tool usage: ${toolName}
+Input: ${JSON.stringify(input)}
+Output: ${JSON.stringify(output)}`,
+        },
+      ],
+      model: "meta-llama/llama-4-scout-17b-16e-instruct",
+      temperature: 0.0,
+      max_tokens: 10,
+    },
+    {
+      headers: {
+        "Helicone-Session-Id": sessionId,
+        "Helicone-Session-Name": sessionName,
+        "Helicone-Session-Path": sessionPath,
+      },
+    }
+  );
+}
+
 // Processing logic for the multi-step query
 async function processMultiStepQuery(text: string): Promise<string> {
   // Create a unique session ID for tracking in Helicone
   const sessionId = randomUUID();
-  const sessionName = "Multi-Step Sentiment Agent";
+  const sessionName = "Multi-Step Agent";
 
   // Initialize Groq client with Helicone
   const groq = new Groq({
@@ -62,57 +97,90 @@ async function processMultiStepQuery(text: string): Promise<string> {
   const classification = classify.choices?.[0]?.message?.content?.toLowerCase() || "general";
   console.log(`  Classification: ${classification}`);
 
-  // Step 2: Handle based on classification
-  console.log("Step 2: Generating result based on classification");
+  // Step 2: Knowledge Retrieval or Tool Use
+  console.log("Step 2: Knowledge Retrieval or Tool Use");
   let result = "";
 
   if (classification.includes("question")) {
-    // Better keyword extraction and matching
+    // Look for keywords in the knowledge base
     const inputText = text.toLowerCase();
     console.log(`  Looking for keywords in: "${inputText}"`);
+    
+    let toolOutput;
     
     // Check for explicit keywords
     if (inputText.includes("ai") || inputText.includes("artificial intelligence")) {
       result = knowledgeBase["ai"];
+      toolOutput = { found: true, keyword: "ai", value: knowledgeBase["ai"] };
       console.log(`  Found match: "ai"`);
     } else if (inputText.includes("helicone")) {
       result = knowledgeBase["helicone"];
+      toolOutput = { found: true, keyword: "helicone", value: knowledgeBase["helicone"] };
       console.log(`  Found match: "helicone"`);
     } else if (inputText.includes("rag") || inputText.includes("retrieval")) {
       result = knowledgeBase["rag"];
+      toolOutput = { found: true, keyword: "rag", value: knowledgeBase["rag"] };
       console.log(`  Found match: "rag"`);
     } else {
       result = "No relevant knowledge found.";
+      toolOutput = { found: false, message: "No relevant knowledge found." };
       console.log(`  No matches found in knowledge base`);
     }
+    
+    // Log tool usage to Helicone
+    await logToolUse(
+      groq, 
+      "knowledgeBaseLookup", 
+      { query: text }, 
+      toolOutput,
+      sessionId,
+      sessionName,
+      "/knowledge-retrieval"
+    );
   } else {
-    // Use current time
-    result = `Current time is ${getCurrentTime()}`;
+    // Get current time
+    const time = getCurrentTime();
+    result = `Current time is ${time}`;
+    
+    // Log tool usage to Helicone
+    await logToolUse(
+      groq, 
+      "getCurrentTime", 
+      {}, 
+      { time: time },
+      sessionId,
+      sessionName,
+      "/get-time"
+    );
   }
+  
   console.log(`  Result: ${result}`);
 
-  // Manually log tool result
-  console.log("Step 3: Logging tool result");
-  await groq.chat.completions.create(
+  // Step 3: Reasoning about the response
+  console.log("Step 3: Reasoning about the response");
+  const reasoning = await groq.chat.completions.create(
     {
       messages: [
         {
           role: "user",
-          content: `Manual tool log: ${result}`,
+          content: `Based on this context: "${result}", reason step by step about how to answer the user's query: "${text}"`,
         },
       ],
       model: "meta-llama/llama-4-scout-17b-16e-instruct",
-      temperature: 0.0,
-      max_tokens: 10,
+      temperature: 0.3,
+      max_tokens: 200,
     },
     {
       headers: {
         "Helicone-Session-Id": sessionId,
         "Helicone-Session-Name": sessionName,
-        "Helicone-Session-Path": "/tool-output",
+        "Helicone-Session-Path": "/reasoning",
       },
     }
   );
+
+  const reasoningOutput = reasoning.choices?.[0]?.message?.content || "";
+  console.log(`  Reasoning: ${reasoningOutput}`);
 
   // Step 4: Generate final output
   console.log("Step 4: Generating final response");
@@ -120,13 +188,19 @@ async function processMultiStepQuery(text: string): Promise<string> {
     {
       messages: [
         {
+          role: "system",
+          content: `You are a helpful assistant that provides accurate and friendly responses.
+Here is some retrieved context: "${result}"
+Here is some reasoning about how to respond: "${reasoningOutput}"`,
+        },
+        {
           role: "user",
-          content: `Using the following context, generate a friendly response: "${result}"`,
+          content: text,
         },
       ],
       model: "meta-llama/llama-4-scout-17b-16e-instruct",
       temperature: 0.5,
-      max_tokens: 300,
+      max_tokens: 500,
     },
     {
       headers: {
@@ -137,7 +211,10 @@ async function processMultiStepQuery(text: string): Promise<string> {
     }
   );
 
-  return finalReply.choices?.[0]?.message?.content || "No final response.";
+  const finalResponse = finalReply.choices?.[0]?.message?.content || "No final response.";
+  console.log(`  Final response: ${finalResponse}`);
+
+  return finalResponse;
 }
 
 // REST API route handler
@@ -178,9 +255,9 @@ app.get("/health", (req: Request, res: Response) => {
 app.get("/", (req: Request, res: Response) => {
   res.send(`
     <html>
-      <head><title>Multi-Step Sentiment + Knowledge Agent</title></head>
+      <head><title>Enhanced Multi-Step Agent</title></head>
       <body>
-        <h1>Multi-Step Sentiment + Knowledge Agent</h1>
+        <h1>Enhanced Multi-Step Agent</h1>
         <h2>Available Endpoints:</h2>
         <ul>
           <li><strong>Analyze:</strong> POST to /analyze with {"text": "your query"}</li>

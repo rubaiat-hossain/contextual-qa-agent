@@ -10,6 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@helicone/helpers": "^1.1.0",
     "@modelcontextprotocol/sdk": "^1.10.2",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
