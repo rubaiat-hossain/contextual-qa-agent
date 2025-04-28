@@ -4,24 +4,23 @@ config();
 import express, { Request, Response } from "express";
 import Groq from "groq-sdk";
 import { randomUUID } from "crypto";
+// @ts-ignore
+import { ChromaClient } from "chromadb";
 
 // Initialize Express
 const app = express();
 app.use(express.json());
 
-// Knowledge base for RAG
-const knowledgeBase: Record<string, string> = {
-  "ai": "Artificial Intelligence is the simulation of human intelligence processes by machines, especially computer systems.",
-  "helicone": "Helicone is an observability platform that helps developers monitor and debug LLM applications.",
-  "rag": "Retrieval-Augmented Generation (RAG) combines retrieval of external knowledge with text generation to produce more accurate results."
-};
+// Initialize ChromaDB client (server mode)
+const chroma = new ChromaClient({ path: "http://localhost:8000" }); // correct path!
+let collection: Awaited<ReturnType<ChromaClient["getOrCreateCollection"]>>;
 
 // Global Groq client
 const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY || "",
+  apiKey: process.env.GROQ_API_KEY ?? "",
   baseURL: "https://groq.helicone.ai",
   defaultHeaders: {
-    "Helicone-Auth": `Bearer ${process.env.HELICONE_API_KEY || ""}`,
+    "Helicone-Auth": `Bearer ${process.env.HELICONE_API_KEY ?? ""}`,
   },
 });
 
@@ -30,7 +29,7 @@ function getCurrentTime(): string {
   return new Date().toISOString();
 }
 
-// Helper: Log tool use manually
+// Helper: Log tool use manually to Helicone
 async function logTool(
   toolName: string,
   input: Record<string, any>,
@@ -44,9 +43,7 @@ async function logTool(
       messages: [
         {
           role: "user",
-          content: `Tool: ${toolName}
-Input: ${JSON.stringify(input)}
-Output: ${JSON.stringify(output)}`,
+          content: `Tool: ${toolName}\nInput: ${JSON.stringify(input)}\nOutput: ${JSON.stringify(output)}`,
         },
       ],
       model: "meta-llama/llama-4-scout-17b-16e-instruct",
@@ -59,26 +56,56 @@ Output: ${JSON.stringify(output)}`,
         "Helicone-Session-Path": sessionPath,
         "Helicone-Session-Name": sessionName,
         "Helicone-Property-ToolName": toolName,
-        "Helicone-Property-ToolType": toolName.includes("knowledge") ? "retrieval" : "function",
+        "Helicone-Property-ToolType": toolName.includes("Retrieval") ? "retrieval" : "function",
       },
     }
   );
 }
 
-// Main multi-step agent logic
+// Seed ChromaDB with knowledge if empty
+async function seedKnowledgeBase() {
+  collection = await chroma.getOrCreateCollection({ name: "knowledge" });
+
+  const count = await collection.count();
+  if (count === 0) {
+    console.log("📚 Seeding ChromaDB knowledge base...");
+    await collection.add({
+      ids: ["ai", "helicone", "rag", "observability", "mcp", "llmops"],
+      metadatas: [
+        { topic: "AI" },
+        { topic: "Helicone" },
+        { topic: "RAG" },
+        { topic: "Observability" },
+        { topic: "Model Context Protocol" },
+        { topic: "LLMOps" },
+      ],
+      documents: [
+        "Artificial Intelligence (AI) is the simulation of human-like intelligence by machines to perform tasks like learning, reasoning, and problem-solving.",
+        "Helicone is a developer platform for monitoring and debugging AI agents and LLM applications. It provides observability into prompts, costs, latency, and session flows.",
+        "Retrieval-Augmented Generation (RAG) is an AI framework that retrieves external information and injects it into the prompt for better, more factual responses.",
+        "Observability in AI refers to the practice of understanding, monitoring, and debugging model behavior by tracking key metrics like latency, cost, token usage, and session traces.",
+        "Model Context Protocol (MCP) allows AI agents to connect external tools, APIs, or services dynamically at runtime using a standard protocol for enhanced capabilities.",
+        "LLMOps refers to operational practices around managing, monitoring, scaling, and debugging large language models in production environments.",
+      ],
+    });
+    
+    console.log("✅ Knowledge base seeded.");
+  }
+}
+
+// Main Multi-Step Agent
 async function processMultiStepQuery(text: string): Promise<string> {
   const sessionId = randomUUID();
-  const sessionName = "Multi-Step Agent";
+  const sessionName = "Multi-Step RAG Agent";
 
-  console.log(`Processing query: "${text}"`);
+  console.log(`🚀 New Query: "${text}"`);
 
   // Step 1: Classify
-  console.log("Step 1: Classifying intent");
   const classify = await groq.chat.completions.create(
     {
       messages: [
-        { role: "system", content: "You are a query classifier. Respond ONLY 'question' or 'general'." },
-        { role: "user", content: `Classify this: "${text}"` },
+        { role: "system", content: "Respond ONLY with 'question' or 'general'." },
+        { role: "user", content: `Classify: "${text}"` },
       ],
       model: "meta-llama/llama-4-scout-17b-16e-instruct",
       temperature: 0.3,
@@ -93,44 +120,31 @@ async function processMultiStepQuery(text: string): Promise<string> {
     }
   );
 
-  const classification = classify.choices?.[0]?.message?.content?.trim().toLowerCase() || "general";
-  console.log(`  Classification: ${classification}`);
+  const classification = classify.choices?.[0]?.message?.content?.trim().toLowerCase() ?? "general";
 
-  // Step 2: Retrieval or tool use
-  let result = "";
+  // Step 2: Retrieval or Tool Use
+  let context = "";
+
   if (classification.includes("question")) {
-    const input = text.toLowerCase();
-    let retrievalResult: Record<string, any> = { found: false, query: text };
+    const results = await collection.query({
+      queryTexts: [text],
+      nResults: 1,
+    });
 
-    if (input.includes("ai") || input.includes("artificial intelligence")) {
-      result = knowledgeBase["ai"];
-      retrievalResult = { found: true, keyword: "ai", value: knowledgeBase["ai"] };
-    } else if (input.includes("helicone")) {
-      result = knowledgeBase["helicone"];
-      retrievalResult = { found: true, keyword: "helicone", value: knowledgeBase["helicone"] };
-    } else if (input.includes("rag") || input.includes("retrieval")) {
-      result = knowledgeBase["rag"];
-      retrievalResult = { found: true, keyword: "rag", value: knowledgeBase["rag"] };
-    } else {
-      result = "No relevant knowledge found.";
-    }
-
-    await logTool("knowledgeBaseLookup", { query: text }, retrievalResult, sessionId, "/knowledge-retrieval", sessionName);
+    context = results.documents?.[0]?.[0] ?? "No relevant knowledge found.";
+    await logTool("ChromaDBRetrieval", { query: text }, { result: context }, sessionId, "/knowledge-retrieval", sessionName);
   } else {
     const time = getCurrentTime();
-    result = `Current time is ${time}`;
-    await logTool("getCurrentTime", {}, { time }, sessionId, "/tool-execution", sessionName);
+    context = `Current time is ${time}`;
+    await logTool("GetCurrentTime", {}, { time }, sessionId, "/tool-execution", sessionName);
   }
 
-  console.log(`  Result: ${result}`);
-
   // Step 3: Reasoning
-  console.log("Step 3: Reasoning");
   const reasoning = await groq.chat.completions.create(
     {
       messages: [
         { role: "system", content: "You are a reasoning assistant." },
-        { role: "user", content: `Given this: "${result}", explain step by step how to answer "${text}"` },
+        { role: "user", content: `Context: "${context}". Reason about how to answer "${text}".` },
       ],
       model: "meta-llama/llama-4-scout-17b-16e-instruct",
       temperature: 0.3,
@@ -145,16 +159,15 @@ async function processMultiStepQuery(text: string): Promise<string> {
     }
   );
 
-  const reasoningOutput = reasoning.choices?.[0]?.message?.content || "";
+  const reasoningOutput = reasoning.choices?.[0]?.message?.content ?? "";
 
-  // Step 4: Final Response
-  console.log("Step 4: Final Response");
+  // Step 4: Final Output
   const finalReply = await groq.chat.completions.create(
     {
       messages: [
         {
           role: "system",
-          content: `You are a friendly assistant. Context: "${result}". Reasoning: "${reasoningOutput}"`,
+          content: `Friendly assistant.\nContext: "${context}".\nReasoning: "${reasoningOutput}".`,
         },
         { role: "user", content: text },
       ],
@@ -171,13 +184,10 @@ async function processMultiStepQuery(text: string): Promise<string> {
     }
   );
 
-  const finalResponse = finalReply.choices?.[0]?.message?.content || "No final response.";
-  console.log(`  Final response ready.`);
-
-  return finalResponse;
+  return finalReply.choices?.[0]?.message?.content ?? "No final response.";
 }
 
-// REST endpoint
+// Express Routes
 app.post("/analyze", async (req: Request, res: Response) => {
   const { text } = req.body;
   if (!text) {
@@ -188,20 +198,21 @@ app.post("/analyze", async (req: Request, res: Response) => {
   try {
     const result = await processMultiStepQuery(text);
     res.json({ response: result });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("API Error:", err);
-    res.status(500).json({ error: err.message || "Internal error" });
+    res.status(500).json({ error: err instanceof Error ? err.message : "Internal Server Error" });
   }
 });
 
-// Health check
-app.get("/health", (req: Request, res: Response) => {
+app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok" });
 });
 
-// Start server
+// Start Server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running at http://localhost:${PORT}`);
-  console.log(`Test: curl -X POST http://localhost:${PORT}/analyze -H "Content-Type: application/json" -d '{"text": "what is ai?"}'`);
+seedKnowledgeBase().then(() => {
+  app.listen(PORT, () => {
+    console.log(`✅ Server running at http://localhost:${PORT}`);
+    console.log(`POST /analyze {"text": "your question"}`);
+  });
 });
