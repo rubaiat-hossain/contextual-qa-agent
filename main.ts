@@ -6,16 +6,14 @@ import Groq from "groq-sdk";
 import { randomUUID } from "crypto";
 // @ts-ignore
 import { ChromaClient } from "chromadb";
+import { HeliconeManualLogger } from "@helicone/helpers";
 
-// Initialize Express
 const app = express();
 app.use(express.json());
 
-// Initialize ChromaDB client (server mode)
-const chroma = new ChromaClient({ path: "http://localhost:8000" }); // correct path!
+const chroma = new ChromaClient({ path: "http://localhost:8000" });
 let collection: Awaited<ReturnType<ChromaClient["getOrCreateCollection"]>>;
 
-// Global Groq client
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY ?? "",
   baseURL: "https://groq.helicone.ai",
@@ -24,45 +22,80 @@ const groq = new Groq({
   },
 });
 
-// Helper: Get current time
-function getCurrentTime(): string {
-  return new Date().toISOString();
-}
+const heliconeLogger = new HeliconeManualLogger({
+  apiKey: process.env.HELICONE_API_KEY,
+});
 
-// Helper: Log tool use manually to Helicone
-async function logTool(
-  toolName: string,
-  input: Record<string, any>,
-  output: Record<string, any>,
-  sessionId: string,
-  sessionPath: string,
-  sessionName: string
-): Promise<void> {
-  await groq.chat.completions.create(
-    {
-      messages: [
-        {
-          role: "user",
-          content: `Tool: ${toolName}\nInput: ${JSON.stringify(input)}\nOutput: ${JSON.stringify(output)}`,
-        },
-      ],
-      model: "meta-llama/llama-4-scout-17b-16e-instruct",
-      temperature: 0,
-      max_tokens: 5,
-    },
-    {
-      headers: {
-        "Helicone-Session-Id": sessionId,
-        "Helicone-Session-Path": sessionPath,
-        "Helicone-Session-Name": sessionName,
-        "Helicone-Property-ToolName": toolName,
-        "Helicone-Property-ToolType": toolName.includes("Retrieval") ? "retrieval" : "function",
+// FIXED: Reimplemented based on OpenAI example
+async function getCurrentTime(sessionId: string, sessionName: string): Promise<string> {
+  try {
+    const timestamp = await heliconeLogger.logRequest(
+      {
+        _type: "tool",
+        toolName: "getCurrentTime",
+        input: {},
       },
-    }
-  );
+      async (recorder) => {
+        const now = new Date().toISOString();
+        // Simply record the result
+        recorder.appendResults({ time: now });
+        // Return the raw timestamp
+        return now;
+      },
+      {
+        "Helicone-Session-Id": sessionId,
+        "Helicone-Session-Path": "/manual-tool-log",
+        "Helicone-Session-Name": sessionName,
+      }
+    );
+    
+    console.log(`✅ getCurrentTime executed: ${timestamp}`);
+    return timestamp;
+  } catch (error) {
+    console.error("Error in getCurrentTime tool:", error);
+    throw error;
+  }
 }
 
-// Seed ChromaDB with knowledge if empty
+// FIXED: Reimplemented based on OpenAI example
+async function retrieveFromChromaDB(query: string, sessionId: string, sessionName: string): Promise<string> {
+  try {
+    const document = await heliconeLogger.logRequest(
+      {
+        _type: "tool",
+        toolName: "ChromaDBRetrieval",
+        input: { query },
+      },
+      async (recorder) => {
+        // Query ChromaDB
+        const results = await collection.query({
+          queryTexts: [query],
+          nResults: 1,
+        });
+        
+        const retrievedDoc = results.documents?.[0]?.[0] ?? "No relevant knowledge found.";
+        
+        // Record the result 
+        recorder.appendResults({ document: retrievedDoc });
+        
+        // Return the raw document
+        return retrievedDoc;
+      },
+      {
+        "Helicone-Session-Id": sessionId,
+        "Helicone-Session-Path": "/knowledge-retrieval",
+        "Helicone-Session-Name": sessionName,
+      }
+    );
+    
+    console.log(`✅ ChromaDBRetrieval executed`);
+    return document;
+  } catch (error) {
+    console.error("Error in ChromaDBRetrieval tool:", error);
+    throw error;
+  }
+}
+
 async function seedKnowledgeBase() {
   collection = await chroma.getOrCreateCollection({ name: "knowledge" });
 
@@ -88,58 +121,63 @@ async function seedKnowledgeBase() {
         "LLMOps refers to operational practices around managing, monitoring, scaling, and debugging large language models in production environments.",
       ],
     });
-    
     console.log("✅ Knowledge base seeded.");
   }
 }
 
-// Main Multi-Step Agent
 async function processMultiStepQuery(text: string): Promise<string> {
   const sessionId = randomUUID();
   const sessionName = "Multi-Step RAG Agent";
 
   console.log(`🚀 New Query: "${text}"`);
+  console.log(`📊 Session ID: ${sessionId}`);
 
-  // Step 1: Classify
-  const classify = await groq.chat.completions.create(
-    {
-      messages: [
-        { role: "system", content: "Respond ONLY with 'question' or 'general'." },
-        { role: "user", content: `Classify: "${text}"` },
-      ],
-      model: "meta-llama/llama-4-scout-17b-16e-instruct",
-      temperature: 0.3,
-      max_tokens: 10,
-    },
-    {
-      headers: {
-        "Helicone-Session-Id": sessionId,
-        "Helicone-Session-Path": "/classify",
-        "Helicone-Session-Name": sessionName,
-      },
-    }
-  );
+  const isTimeQuestion = /\b(what\s+time\s+is\s+it|current\s+time|time\s+now)\b/i.test(text);
 
-  const classification = classify.choices?.[0]?.message?.content?.trim().toLowerCase() ?? "general";
-
-  // Step 2: Retrieval or Tool Use
   let context = "";
 
-  if (classification.includes("question")) {
-    const results = await collection.query({
-      queryTexts: [text],
-      nResults: 1,
-    });
-
-    context = results.documents?.[0]?.[0] ?? "No relevant knowledge found.";
-    await logTool("ChromaDBRetrieval", { query: text }, { result: context }, sessionId, "/knowledge-retrieval", sessionName);
+  if (isTimeQuestion) {
+    console.log("⏰ Processing time question...");
+    // FIXED: Get the raw timestamp
+    const timestamp = await getCurrentTime(sessionId, sessionName);
+    context = `Current time is ${timestamp}`;    
   } else {
-    const time = getCurrentTime();
-    context = `Current time is ${time}`;
-    await logTool("GetCurrentTime", {}, { time }, sessionId, "/tool-execution", sessionName);
+    console.log("🤔 Classifying query...");
+    const classify = await groq.chat.completions.create(
+      {
+        messages: [
+          { role: "system", content: "Respond ONLY with 'question' or 'general'." },
+          { role: "user", content: `Classify: "${text}"` },
+        ],
+        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        temperature: 0.3,
+        max_tokens: 10,
+      },
+      {
+        headers: {
+          "Helicone-Session-Id": sessionId,
+          "Helicone-Session-Path": "/classify",
+          "Helicone-Session-Name": sessionName,
+        },
+      }
+    );
+
+    const classification = classify.choices?.[0]?.message?.content?.trim().toLowerCase() ?? "general";
+    console.log(`📊 Classification: ${classification}`);
+
+    if (classification.includes("question")) {
+      console.log("🔍 Retrieving knowledge...");
+      // FIXED: Get the raw document
+      context = await retrieveFromChromaDB(text, sessionId, sessionName);
+    } else {
+      console.log("⏰ General query, providing time...");
+      // FIXED: Get the raw timestamp
+      const timestamp = await getCurrentTime(sessionId, sessionName);
+      context = `Current time is ${timestamp}`;
+    }
   }
 
-  // Step 3: Reasoning
+  console.log("🧠 Starting reasoning step...");
   const reasoning = await groq.chat.completions.create(
     {
       messages: [
@@ -160,8 +198,9 @@ async function processMultiStepQuery(text: string): Promise<string> {
   );
 
   const reasoningOutput = reasoning.choices?.[0]?.message?.content ?? "";
+  console.log(`🧠 Reasoning complete`);
 
-  // Step 4: Final Output
+  console.log("🎯 Generating final response...");
   const finalReply = await groq.chat.completions.create(
     {
       messages: [
@@ -187,7 +226,6 @@ async function processMultiStepQuery(text: string): Promise<string> {
   return finalReply.choices?.[0]?.message?.content ?? "No final response.";
 }
 
-// Express Routes
 app.post("/analyze", async (req: Request, res: Response) => {
   const { text } = req.body;
   if (!text) {
@@ -196,10 +234,12 @@ app.post("/analyze", async (req: Request, res: Response) => {
   }
 
   try {
+    console.log(`📥 Received query: "${text}"`);
     const result = await processMultiStepQuery(text);
+    console.log(`📤 Sending response`);
     res.json({ response: result });
   } catch (err: unknown) {
-    console.error("API Error:", err);
+    console.error("❌ API Error:", err);
     res.status(500).json({ error: err instanceof Error ? err.message : "Internal Server Error" });
   }
 });
@@ -208,7 +248,6 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok" });
 });
 
-// Start Server
 const PORT = process.env.PORT || 3000;
 seedKnowledgeBase().then(() => {
   app.listen(PORT, () => {
