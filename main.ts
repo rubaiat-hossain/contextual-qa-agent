@@ -28,24 +28,52 @@ const heliconeLogger = new HeliconeManualLogger({
 
 async function getCurrentTime(sessionId: string, sessionName: string): Promise<string> {
   try {
-    const timestamp = await heliconeLogger.logRequest(
+    const startTime = Date.now();
+    const now = new Date().toISOString();
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const localTime = new Date().toLocaleString();
+    
+    const toolOutput = {
+      timestamp: now,
+      metadata: {
+        timezone: timezone,
+        localTime: localTime,
+        unix_timestamp: Math.floor(Date.now() / 1000),
+        tool_version: "1.0.3",
+        execution_duration_ms: Date.now() - startTime
+      }
+    };
+    
+    await groq.chat.completions.create(
       {
-        _type: "tool",
-        toolName: "getCurrentTime",
-        input: {},
-      },
-      async (recorder) => {
-        const now = new Date().toISOString();
-        recorder.appendResults({ time: now });
-        return now;
+        messages: [
+          {
+            role: "user",
+            content: `Tool: getCurrentTime\nInput: {}\nOutput: ${JSON.stringify(toolOutput, null, 2)}`,
+          },
+        ],
+        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        temperature: 0,
+        max_tokens: 5,
       },
       {
-        "Helicone-Session-Id": sessionId,
-        "Helicone-Session-Path": "/manual-tool-log",
-        "Helicone-Session-Name": sessionName,
+        headers: {
+          "Helicone-Session-Id": sessionId,
+          "Helicone-Session-Path": "/manual-tool-log",
+          "Helicone-Session-Name": sessionName,
+          "Helicone-Property-ToolName": "getCurrentTime",
+          "Helicone-Property-ToolType": "function",
+          "Helicone-Property-QueryType": "time-request",
+          "Helicone-Property-ToolInfo": "ISO timestamp generator",
+          "Helicone-Property-ExecutionTime": now,
+          "Helicone-Property-ExecutionDuration": `${Date.now() - startTime}ms`,
+          "Helicone-Property-Timezone": timezone,
+          "Helicone-Property-ToolVersion": "1.0.3"
+        },
       }
     );
-    return timestamp;
+    
+    return now;
   } catch (error) {
     console.error("Error in getCurrentTime tool:", error);
     throw error;
@@ -54,28 +82,65 @@ async function getCurrentTime(sessionId: string, sessionName: string): Promise<s
 
 async function retrieveFromChromaDB(query: string, sessionId: string, sessionName: string): Promise<string> {
   try {
-    const document = await heliconeLogger.logRequest(
+    const startTime = Date.now();
+    
+    const results = await collection.query({
+      queryTexts: [query],
+      nResults: 3,
+    });
+    
+    const matches = results.documents?.[0] || [];
+    const distances = results.distances?.[0] || [];
+    const ids = results.ids?.[0] || [];
+    
+    const document = matches[0] ?? "No relevant knowledge found.";
+    
+    const toolOutput = {
+      document: document,
+      metadata: {
+        query: query,
+        matches_count: matches.length,
+        top_matches: matches.map((doc, i) => ({
+          id: ids[i],
+          text: doc,
+          relevance_score: distances[i] ? (1 - distances[i]) : 0
+        })),
+        execution_duration_ms: Date.now() - startTime,
+        db_name: "knowledge",
+        tool_version: "1.0.3"
+      }
+    };
+    
+    await groq.chat.completions.create(
       {
-        _type: "tool",
-        toolName: "ChromaDBRetrieval",
-        input: { query },
-      },
-      async (recorder) => {
-        const results = await collection.query({
-          queryTexts: [query],
-          nResults: 1,
-        });
-        
-        const retrievedDoc = results.documents?.[0]?.[0] ?? "No relevant knowledge found.";
-        recorder.appendResults({ document: retrievedDoc });
-        return retrievedDoc;
+        messages: [
+          {
+            role: "user",
+            content: `Tool: ChromaDBRetrieval\nInput: ${JSON.stringify({ query })}\nOutput: ${JSON.stringify(toolOutput, null, 2)}`,
+          },
+        ],
+        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        temperature: 0,
+        max_tokens: 5,
       },
       {
-        "Helicone-Session-Id": sessionId,
-        "Helicone-Session-Path": "/knowledge-retrieval",
-        "Helicone-Session-Name": sessionName,
+        headers: {
+          "Helicone-Session-Id": sessionId,
+          "Helicone-Session-Path": "/knowledge-retrieval",
+          "Helicone-Session-Name": sessionName,
+          "Helicone-Property-ToolName": "ChromaDBRetrieval",
+          "Helicone-Property-ToolType": "retrieval",
+          "Helicone-Property-QueryType": "knowledge-request",
+          "Helicone-Property-ToolInfo": "Vector database lookup",
+          "Helicone-Property-ExecutionTime": new Date().toISOString(),
+          "Helicone-Property-ExecutionDuration": `${Date.now() - startTime}ms`,
+          "Helicone-Property-MatchCount": matches.length.toString(),
+          "Helicone-Property-DBName": "knowledge",
+          "Helicone-Property-ToolVersion": "1.0.3"
+        },
       }
     );
+    
     return document;
   } catch (error) {
     console.error("Error in ChromaDBRetrieval tool:", error);
@@ -88,7 +153,6 @@ async function seedKnowledgeBase() {
 
   const count = await collection.count();
   if (count === 0) {
-    console.log("📚 Seeding ChromaDB knowledge base...");
     await collection.add({
       ids: ["ai", "helicone", "rag", "observability", "mcp", "llmops"],
       metadatas: [
@@ -108,20 +172,27 @@ async function seedKnowledgeBase() {
         "LLMOps refers to operational practices around managing, monitoring, scaling, and debugging large language models in production environments.",
       ],
     });
-    console.log("✅ Knowledge base seeded.");
   }
 }
 
 async function processMultiStepQuery(text: string): Promise<string> {
+  const startTime = Date.now();
   const sessionId = randomUUID();
+  const runId = `run_${randomUUID().substring(0, 8)}`;
   const sessionName = "Multi-Step RAG Agent";
   const isTimeQuestion = /\b(what\s+time\s+is\s+it|current\s+time|time\s+now)\b/i.test(text);
+  
   let context = "";
+  let stepsTaken = [];
 
   if (isTimeQuestion) {
-    const timestamp = await getCurrentTime(sessionId, sessionName);
-    context = `Current time is ${timestamp}`;    
+    stepsTaken.push("time_detection");
+    const time = await getCurrentTime(sessionId, sessionName);
+    context = `Current time is ${time}`;
+    stepsTaken.push("time_retrieval");
   } else {
+    stepsTaken.push("query_classification");
+    
     const classify = await groq.chat.completions.create(
       {
         messages: [
@@ -137,20 +208,28 @@ async function processMultiStepQuery(text: string): Promise<string> {
           "Helicone-Session-Id": sessionId,
           "Helicone-Session-Path": "/classify",
           "Helicone-Session-Name": sessionName,
+          "Helicone-Property-Step": "classification",
+          "Helicone-Property-QueryText": text.substring(0, 100),
+          "Helicone-Property-RunId": runId,
+          "Helicone-Property-StepNumber": "1"
         },
       }
     );
 
     const classification = classify.choices?.[0]?.message?.content?.trim().toLowerCase() ?? "general";
-
+    
     if (classification.includes("question")) {
+      stepsTaken.push("knowledge_retrieval");
       context = await retrieveFromChromaDB(text, sessionId, sessionName);
     } else {
-      const timestamp = await getCurrentTime(sessionId, sessionName);
-      context = `Current time is ${timestamp}`;
+      stepsTaken.push("time_fallback");
+      const time = await getCurrentTime(sessionId, sessionName);
+      context = `Current time is ${time}`;
     }
   }
 
+  stepsTaken.push("reasoning");
+  
   const reasoning = await groq.chat.completions.create(
     {
       messages: [
@@ -166,12 +245,17 @@ async function processMultiStepQuery(text: string): Promise<string> {
         "Helicone-Session-Id": sessionId,
         "Helicone-Session-Path": "/reasoning",
         "Helicone-Session-Name": sessionName,
+        "Helicone-Property-Step": "reasoning",
+        "Helicone-Property-Context": context.substring(0, 100),
+        "Helicone-Property-RunId": runId,
+        "Helicone-Property-StepNumber": "2"
       },
     }
   );
 
   const reasoningOutput = reasoning.choices?.[0]?.message?.content ?? "";
-
+  stepsTaken.push("response_generation");
+  
   const finalReply = await groq.chat.completions.create(
     {
       messages: [
@@ -190,6 +274,12 @@ async function processMultiStepQuery(text: string): Promise<string> {
         "Helicone-Session-Id": sessionId,
         "Helicone-Session-Path": "/final-response",
         "Helicone-Session-Name": sessionName,
+        "Helicone-Property-Step": "response",
+        "Helicone-Property-QueryType": isTimeQuestion ? "time" : "knowledge",
+        "Helicone-Property-RunId": runId,
+        "Helicone-Property-StepNumber": "3",
+        "Helicone-Property-ExecutionPath": stepsTaken.join(","),
+        "Helicone-Property-TotalDuration": `${Date.now() - startTime}ms`
       },
     }
   );
@@ -205,22 +295,35 @@ app.post("/analyze", async (req: Request, res: Response) => {
   }
 
   try {
+    const startTime = Date.now();
     const result = await processMultiStepQuery(text);
-    res.json({ response: result });
+    const duration = Date.now() - startTime;
+    
+    res.json({ 
+      response: result,
+      metadata: {
+        processing_time_ms: duration,
+        timestamp: new Date().toISOString(),
+        query_length: text.length
+      }
+    });
   } catch (err: unknown) {
-    console.error("API Error:", err);
+    console.error("Error:", err);
     res.status(500).json({ error: err instanceof Error ? err.message : "Internal Server Error" });
   }
 });
 
 app.get("/health", (_req: Request, res: Response) => {
-  res.json({ status: "ok" });
+  res.json({ 
+    status: "ok", 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
 });
 
 const PORT = process.env.PORT || 3000;
 seedKnowledgeBase().then(() => {
   app.listen(PORT, () => {
-    console.log(`✅ Server running at http://localhost:${PORT}`);
-    console.log(`POST /analyze {"text": "your question"}`);
+    console.log(`Server running at http://localhost:${PORT}`);
   });
 });
