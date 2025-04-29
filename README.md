@@ -27,8 +27,8 @@ A powerful multi-step agent that implements Retrieval-Augmented Generation (RAG)
 1. **Clone the repository**
 
 ```bash
-git clone https://your-repository-url.git
-cd multi-step-agent
+git clone https://github.com/rubaiat-hossain/contextual-qa-agent.git
+cd contextual-qa-agent
 ```
 
 2. **Install dependencies**
