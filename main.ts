@@ -26,7 +26,6 @@ const heliconeLogger = new HeliconeManualLogger({
   apiKey: process.env.HELICONE_API_KEY,
 });
 
-// FIXED: Reimplemented based on OpenAI example
 async function getCurrentTime(sessionId: string, sessionName: string): Promise<string> {
   try {
     const timestamp = await heliconeLogger.logRequest(
@@ -37,9 +36,7 @@ async function getCurrentTime(sessionId: string, sessionName: string): Promise<s
       },
       async (recorder) => {
         const now = new Date().toISOString();
-        // Simply record the result
         recorder.appendResults({ time: now });
-        // Return the raw timestamp
         return now;
       },
       {
@@ -48,8 +45,6 @@ async function getCurrentTime(sessionId: string, sessionName: string): Promise<s
         "Helicone-Session-Name": sessionName,
       }
     );
-    
-    console.log(`✅ getCurrentTime executed: ${timestamp}`);
     return timestamp;
   } catch (error) {
     console.error("Error in getCurrentTime tool:", error);
@@ -57,7 +52,6 @@ async function getCurrentTime(sessionId: string, sessionName: string): Promise<s
   }
 }
 
-// FIXED: Reimplemented based on OpenAI example
 async function retrieveFromChromaDB(query: string, sessionId: string, sessionName: string): Promise<string> {
   try {
     const document = await heliconeLogger.logRequest(
@@ -67,18 +61,13 @@ async function retrieveFromChromaDB(query: string, sessionId: string, sessionNam
         input: { query },
       },
       async (recorder) => {
-        // Query ChromaDB
         const results = await collection.query({
           queryTexts: [query],
           nResults: 1,
         });
         
         const retrievedDoc = results.documents?.[0]?.[0] ?? "No relevant knowledge found.";
-        
-        // Record the result 
         recorder.appendResults({ document: retrievedDoc });
-        
-        // Return the raw document
         return retrievedDoc;
       },
       {
@@ -87,8 +76,6 @@ async function retrieveFromChromaDB(query: string, sessionId: string, sessionNam
         "Helicone-Session-Name": sessionName,
       }
     );
-    
-    console.log(`✅ ChromaDBRetrieval executed`);
     return document;
   } catch (error) {
     console.error("Error in ChromaDBRetrieval tool:", error);
@@ -128,21 +115,13 @@ async function seedKnowledgeBase() {
 async function processMultiStepQuery(text: string): Promise<string> {
   const sessionId = randomUUID();
   const sessionName = "Multi-Step RAG Agent";
-
-  console.log(`🚀 New Query: "${text}"`);
-  console.log(`📊 Session ID: ${sessionId}`);
-
   const isTimeQuestion = /\b(what\s+time\s+is\s+it|current\s+time|time\s+now)\b/i.test(text);
-
   let context = "";
 
   if (isTimeQuestion) {
-    console.log("⏰ Processing time question...");
-    // FIXED: Get the raw timestamp
     const timestamp = await getCurrentTime(sessionId, sessionName);
     context = `Current time is ${timestamp}`;    
   } else {
-    console.log("🤔 Classifying query...");
     const classify = await groq.chat.completions.create(
       {
         messages: [
@@ -163,21 +142,15 @@ async function processMultiStepQuery(text: string): Promise<string> {
     );
 
     const classification = classify.choices?.[0]?.message?.content?.trim().toLowerCase() ?? "general";
-    console.log(`📊 Classification: ${classification}`);
 
     if (classification.includes("question")) {
-      console.log("🔍 Retrieving knowledge...");
-      // FIXED: Get the raw document
       context = await retrieveFromChromaDB(text, sessionId, sessionName);
     } else {
-      console.log("⏰ General query, providing time...");
-      // FIXED: Get the raw timestamp
       const timestamp = await getCurrentTime(sessionId, sessionName);
       context = `Current time is ${timestamp}`;
     }
   }
 
-  console.log("🧠 Starting reasoning step...");
   const reasoning = await groq.chat.completions.create(
     {
       messages: [
@@ -198,9 +171,7 @@ async function processMultiStepQuery(text: string): Promise<string> {
   );
 
   const reasoningOutput = reasoning.choices?.[0]?.message?.content ?? "";
-  console.log(`🧠 Reasoning complete`);
 
-  console.log("🎯 Generating final response...");
   const finalReply = await groq.chat.completions.create(
     {
       messages: [
@@ -234,12 +205,10 @@ app.post("/analyze", async (req: Request, res: Response) => {
   }
 
   try {
-    console.log(`📥 Received query: "${text}"`);
     const result = await processMultiStepQuery(text);
-    console.log(`📤 Sending response`);
     res.json({ response: result });
   } catch (err: unknown) {
-    console.error("❌ API Error:", err);
+    console.error("API Error:", err);
     res.status(500).json({ error: err instanceof Error ? err.message : "Internal Server Error" });
   }
 });
